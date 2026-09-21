@@ -375,7 +375,7 @@ describe('panel', function()
     panel.open()
     ok(panel.is_open(), 'panel window is open')
     eq(#vim.api.nvim_tabpage_list_wins(0), before + 1, 'one more window')
-    eq(vim.api.nvim_win_get_width(panel._state.win), 44, 'configured width')
+    eq(vim.api.nvim_win_get_width(panel._state.win), 50, 'configured width')
     ok(vim.wo[panel._state.win].winfixwidth, 'winfixwidth is set')
     eq(vim.bo[panel._state.buf].buftype, 'prompt', 'prompt buffer')
     eq(vim.bo[panel._state.buf].filetype, 'jev', 'filetype jev')
@@ -634,7 +634,7 @@ describe('plugin', function()
     eq(config.get().thresholds.auto, 0.9, 'nested override')
     eq(config.get().thresholds.route, 0.5, 'nested default kept')
     config.setup({})
-    eq(config.get().width, 44, 'setup starts from the defaults again')
+    eq(config.get().width, 50, 'setup starts from the defaults again')
   end)
 
   it('reads the API key from $TYPESAFE_API_KEY when setup has none', function()
@@ -697,6 +697,357 @@ describe('client', function()
     end, 10)
     ok(done, 'the callback fired')
     ok(type(message) == 'string' and message ~= '', 'an error string came back: ' .. tostring(message))
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- The catalog at size: grouping, descriptions, and the request it produces
+-- ---------------------------------------------------------------------------
+
+--- A scratch buffer in the current window, plus the ctx an action is handed.
+---@param lines string[]
+---@return integer win, integer buf, JevCtx ctx
+local function scratch(lines)
+  reset()
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_win_set_buf(win, buf)
+  vim.api.nvim_win_set_cursor(win, { 1, 0 })
+  return win, buf, { target_win = win, target_buf = buf }
+end
+
+--- Call one action directly, the way |jev.ask()| would.
+local function run(name, args, ctx)
+  local action = actions.by_name(name)
+  ok(action, 'no such action: ' .. tostring(name))
+  return action.run(args or {}, ctx)
+end
+
+describe('catalog shape', function()
+  it('is a real catalog, grouped by category', function()
+    local list = actions.list()
+    ok(#list >= 90, 'the catalog is worth routing over: ' .. #list)
+    local grouped = 0
+    local seen = {}
+    for _, group in ipairs(actions.categories()) do
+      ok(type(group.name) == 'string' and group.name ~= '', 'category has a name')
+      ok(not seen[group.name], 'category listed once: ' .. group.name)
+      seen[group.name] = true
+      ok(#group.actions > 0, group.name .. ' is not empty')
+      grouped = grouped + #group.actions
+    end
+    eq(grouped, #list, 'every action lands in exactly one category')
+    for _, action in ipairs(list) do
+      ok(type(action.category) == 'string' and action.category ~= '', action.name .. ': category')
+      ok(seen[action.category], action.name .. ': category is one of the groups')
+    end
+  end)
+
+  it('descriptions are distinct, and tight enough to ride in every request', function()
+    local by_description = {}
+    for _, action in ipairs(actions.list()) do
+      ok(#action.description <= 160, action.name .. ': description is ' .. #action.description .. ' chars')
+      local clash = by_description[action.description]
+      ok(not clash, ('%s and %s share a description'):format(tostring(clash), action.name))
+      by_description[action.description] = action.name
+    end
+  end)
+
+  it('every enum option is a non-empty name', function()
+    for _, action in ipairs(actions.list()) do
+      for name, param in pairs(action.params) do
+        if param.type == 'enum' then
+          local count = 0
+          for value in pairs(param.enum) do
+            ok(type(value) == 'string' and value ~= '', action.name .. '.' .. name .. ': option name')
+            count = count + 1
+          end
+          ok(count > 0, action.name .. '.' .. name .. ': has options')
+          ok(count <= 255, action.name .. '.' .. name .. ': at most 255 options')
+        end
+      end
+    end
+  end)
+
+  it('a long utterance against the whole catalog stays inside one request', function()
+    local build = require('jev.questions').build
+    local utterance = 'please replace the old helper name with a new helper name in this whole '
+      .. 'buffer and then sort the lines and save everything to disk right now'
+    local words = 0
+    for _ in utterance:gmatch('%S+') do
+      words = words + 1
+    end
+    ok(words >= 25, 'a long utterance: ' .. words .. ' words')
+
+    local built = build(actions.list(), utterance)
+    local body = vim.json.encode({ state = utterance, model = 'jev-latest', questions = built.questions })
+
+    local route = built.questions['__tool__']
+    local route_options = vim.tbl_count(route.criteria)
+    eq(route_options, #actions.list() + 1, 'every action, plus __none__')
+    ok(route_options <= 255, 'the route Choice has ' .. route_options .. ' options (max 255)')
+
+    local biggest, biggest_id = 0, ''
+    for id, question in pairs(built.questions) do
+      local size = #vim.json.encode({ instructions = question.instructions, criteria = question.criteria })
+      if size > biggest then
+        biggest, biggest_id = size, id
+      end
+    end
+    -- 32k tokens for `state` plus the longest question; bytes are the cheap proxy.
+    ok(biggest <= 32 * 1024, ('the longest question (%s) is %d bytes'):format(biggest_id, biggest))
+    ok(#body <= 200 * 1024, 'the whole request is ' .. #body .. ' bytes')
+
+    print(
+      ('     (request %d bytes · %d questions · %d route options · longest question %d bytes)'):format(
+        #body,
+        vim.tbl_count(built.questions),
+        route_options,
+        biggest
+      )
+    )
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- A sample of the new actions, in the headless editor
+-- ---------------------------------------------------------------------------
+
+describe('actions at work', function()
+  it('move_line_down and move_line_up swap a line with its neighbour', function()
+    local win, buf, ctx = scratch({ 'one', 'two', 'three' })
+    eq(run('move_line_down', {}, ctx), 'line 2')
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'two', 'one', 'three' })
+    eq(vim.api.nvim_win_get_cursor(win)[1], 2, 'the cursor followed the line')
+    eq(run('move_line_up', {}, ctx), 'line 1')
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'one', 'two', 'three' })
+    local err = throws(function()
+      run('move_line_up', {}, ctx)
+    end, 'moving the first line up should error')
+    ok(err:find('first line', 1, true), err)
+  end)
+
+  it('duplicate_line pastes a copy below', function()
+    local win, buf, ctx = scratch({ 'alpha', 'beta' })
+    eq(run('duplicate_line', {}, ctx), 'duplicated line 1')
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'alpha', 'alpha', 'beta' })
+    eq(vim.api.nvim_win_get_cursor(win)[1], 2)
+  end)
+
+  it('sort_lines sorts, reverses and drops duplicates', function()
+    local _, buf, ctx = scratch({ 'pear', 'apple', 'fig', 'apple' })
+    local said = run('sort_lines', { order = 'ascending', unique = true }, ctx)
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'apple', 'fig', 'pear' })
+    ok(said:find('duplicate', 1, true), 'it says what it dropped: ' .. said)
+    eq(run('sort_lines', { order = 'descending' }, ctx), 'sorted descending')
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'pear', 'fig', 'apple' })
+  end)
+
+  it('trim_trailing_whitespace only touches the lines that need it', function()
+    local _, buf, ctx = scratch({ 'clean', 'trailing   ', 'tabbed\t', '' })
+    eq(run('trim_trailing_whitespace', {}, ctx), 'trimmed 2 lines')
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'clean', 'trailing', 'tabbed', '' })
+    eq(run('trim_trailing_whitespace', {}, ctx), 'trimmed 0 lines', 'a second pass changes nothing')
+  end)
+
+  it('uppercase_line shouts the current line', function()
+    local _, buf, ctx = scratch({ 'quiet line', 'untouched' })
+    eq(run('uppercase_line', {}, ctx), 'uppercased line 1')
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'QUIET LINE', 'untouched' })
+    eq(run('lowercase_line', {}, ctx), 'lowercased line 1')
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'quiet line', 'untouched' })
+  end)
+
+  it('toggle_comment comments a line out and back in', function()
+    local _, buf, ctx = scratch({ 'local x = 1' })
+    vim.bo[buf].filetype = 'lua'
+    run('toggle_comment', {}, ctx)
+    eq(vim.api.nvim_buf_get_lines(buf, 0, 1, false), { '-- local x = 1' })
+    run('toggle_comment', {}, ctx)
+    eq(vim.api.nvim_buf_get_lines(buf, 0, 1, false), { 'local x = 1' })
+  end)
+
+  it('select_word puts the word under the cursor in visual mode', function()
+    local win, buf, ctx = scratch({ 'hello world' })
+    vim.api.nvim_win_set_cursor(win, { 1, 0 })
+    eq(run('select_word', {}, ctx), 'word selected')
+    eq(vim.fn.mode(), 'v', 'visual mode')
+    vim.cmd('normal! ' .. vim.api.nvim_replace_termcodes('<Esc>', true, false, true))
+    eq(vim.api.nvim_buf_get_mark(buf, '<')[2], 0, 'selection starts at the word')
+    eq(vim.fn.getpos("'>")[3], 5, 'and ends at its last character')
+  end)
+
+  it('goto_percent lands part of the way through the file', function()
+    local win, _, ctx = scratch(vim.split(string.rep('x\n', 100):sub(1, -2), '\n', { plain = true }))
+    eq(run('goto_percent', { percent = 50 }, ctx), '50% — line 50')
+    eq(vim.api.nvim_win_get_cursor(win)[1], 50)
+    run('goto_percent', { percent = 0 }, ctx)
+    eq(vim.api.nvim_win_get_cursor(win)[1], 1, 'clamped to the first line')
+    run('goto_percent', { percent = 100 }, ctx)
+    eq(vim.api.nvim_win_get_cursor(win)[1], 100, 'the last line')
+    eq(run('goto_bottom', {}, ctx), 'line 100')
+    eq(run('goto_top', {}, ctx), 'line 1')
+  end)
+
+  it('folding closes, opens and levels the folds', function()
+    local win, _, ctx = scratch({ 'a', 'b', 'c', 'd', 'e' })
+    vim.wo[win].foldmethod = 'manual'
+    vim.cmd('1,3fold')
+    eq(run('unfold_all', {}, ctx), 'unfolded')
+    eq(vim.fn.foldclosed(1), -1, 'the fold is open')
+    eq(run('fold_all', {}, ctx), 'folded')
+    eq(vim.fn.foldclosed(1), 1, 'the fold is closed')
+    vim.api.nvim_win_set_cursor(win, { 1, 0 })
+    eq(run('toggle_fold', {}, ctx), 'fold open')
+    eq(vim.fn.foldclosed(1), -1)
+    eq(run('set_fold_level', { level = 0 }, ctx), 'fold level 0')
+    eq(vim.wo[win].foldlevel, 0)
+    local err = throws(function()
+      vim.api.nvim_win_set_cursor(win, { 5, 0 })
+      run('toggle_fold', {}, ctx)
+    end, 'a line with no fold should error')
+    ok(err:find('no fold', 1, true), err)
+  end)
+
+  it('set_tab_width and set_shiftwidth land on the buffer', function()
+    local _, buf, ctx = scratch({ 'indent me' })
+    eq(run('set_tab_width', { width = 4 }, ctx), 'tab width 4')
+    eq(vim.bo[buf].tabstop, 4)
+    eq(vim.bo[buf].softtabstop, 4)
+    eq(run('set_tab_width', { width = 99 }, ctx), 'tab width 8', 'clamped to the declared range')
+    eq(run('set_shiftwidth', { width = 2 }, ctx), 'shiftwidth 2')
+    eq(vim.bo[buf].shiftwidth, 2)
+  end)
+
+  it('quickfix_open and quickfix_close open and shut the list', function()
+    reset()
+    local ctx = { target_win = vim.api.nvim_get_current_win() }
+    vim.fn.setqflist({ { filename = 'x.lua', lnum = 1, text = 'something' } })
+    local before = #vim.api.nvim_tabpage_list_wins(0)
+    eq(run('quickfix_open', {}, ctx), '1 entries')
+    eq(#vim.api.nvim_tabpage_list_wins(0), before + 1, 'the quickfix window appeared')
+    eq(run('quickfix_close', {}, ctx), 'quickfix closed')
+    eq(#vim.api.nvim_tabpage_list_wins(0), before, 'and went away again')
+    vim.fn.setqflist({})
+    local err = throws(function()
+      run('quickfix_next', {}, ctx)
+    end, 'an empty quickfix list should error')
+    ok(err:find('empty', 1, true), err)
+  end)
+
+  it('the tab actions open, move between and close tab pages', function()
+    reset()
+    eq(#vim.api.nvim_list_tabpages(), 1, 'one tab to start with')
+    run('new_tab')
+    run('new_tab')
+    eq(#vim.api.nvim_list_tabpages(), 3)
+    eq(run('goto_tab', { number = 1 }), 'tab 1')
+    local err = throws(function()
+      run('move_tab', { direction = 'left' })
+    end, 'the first tab cannot move left')
+    ok(err:find('first tab', 1, true), err)
+    run('move_tab', { direction = 'right' })
+    eq(vim.fn.tabpagenr(), 2, 'it moved one place right')
+    eq(run('next_tab'), 'tab 3')
+    eq(run('previous_tab'), 'tab 2')
+    run('close_tab')
+    eq(#vim.api.nvim_list_tabpages(), 2)
+    run('tab_only')
+    eq(#vim.api.nvim_list_tabpages(), 1)
+  end)
+
+  it('resize_window sizes the current split', function()
+    reset()
+    vim.cmd('split')
+    local win = vim.api.nvim_get_current_win()
+    local ctx = { target_win = win, target_buf = vim.api.nvim_win_get_buf(win) }
+    eq(run('resize_window', { dimension = 'height', size = 5 }, ctx), 'height 5')
+    eq(vim.api.nvim_win_get_height(win), 5)
+    run('equalize_windows', {}, ctx)
+    neq(vim.api.nvim_win_get_height(win), 5, 'equalize undid it')
+    vim.cmd('only')
+  end)
+
+  it('replace_in_buffer asks first, then rewrites the buffer', function()
+    local _, buf = scratch({ 'foo one', 'two foo', 'three' })
+    local log = stub_select('Run')
+    stub_client(answer_for('replace_in_buffer', 0.96, {
+      ['replace_in_buffer::find'] = {
+        type = 'choice',
+        choice = 'foo',
+        probabilities = { foo = 0.95, ['(not stated)'] = 0.05 },
+      },
+      ['replace_in_buffer::replacement'] = {
+        type = 'choice',
+        choice = 'bar',
+        probabilities = { bar = 0.93, ['(not stated)'] = 0.07 },
+      },
+    }))
+    ask('replace foo with bar in the whole buffer')
+    eq(#log, 1, 'a destructive action asked first')
+    ok(log[1].prompt:find('replace_in_buffer', 1, true), 'the prompt names the call: ' .. log[1].prompt)
+    eq(
+      vim.api.nvim_buf_get_lines(buf, 0, -1, false),
+      { 'bar one', 'two bar', 'three' },
+      'every occurrence was replaced'
+    )
+    ok(line_with('replaced 2 on 2 lines'), 'the count was reported')
+  end)
+
+  it('replace_in_line only touches the current line, and is undoable', function()
+    local _, buf, ctx = scratch({ 'foo foo', 'foo' })
+    eq(run('replace_in_line', { find = 'foo', replacement = 'bar' }, ctx), 'replaced 2 on line 1')
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { 'bar bar', 'foo' })
+    eq(actions.by_name('replace_in_line').destructive, nil, 'an undoable edit is not destructive')
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- :JevActions and the generated README block
+-- ---------------------------------------------------------------------------
+
+describe('catalog listing', function()
+  it('registers :JevActions', function()
+    vim.g.loaded_jev = nil
+    vim.cmd('runtime! plugin/jev.lua')
+    ok(vim.api.nvim_get_commands({}).JevActions, ':JevActions exists')
+  end)
+
+  it('actions_lines() lists every action under its category', function()
+    local lines = jev.actions_lines()
+    local text = table.concat(lines, '\n')
+    ok(text:find('%d+ actions in %d+ categories'), 'the header counts the catalog')
+    for _, group in ipairs(actions.categories()) do
+      ok(text:find('\n' .. group.name .. ' (' .. #group.actions .. ')', 1, true), 'heading for ' .. group.name)
+    end
+    for _, action in ipairs(actions.list()) do
+      ok(text:find(' ' .. action.name .. ' ', 1, true), 'lists ' .. action.name)
+    end
+    ok(text:find('[destructive]', 1, true), 'destructive actions are flagged')
+    ok(text:find('[read-only]', 1, true), 'read-only actions are flagged')
+  end)
+
+  it('show_actions() opens a scratch buffer with the catalog', function()
+    reset()
+    local buf = jev.show_actions()
+    ok(vim.api.nvim_buf_is_valid(buf), 'a buffer came back')
+    eq(vim.bo[buf].buftype, 'nofile')
+    eq(vim.bo[buf].modifiable, false)
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), jev.actions_lines())
+    pcall(vim.cmd, 'silent! tabclose')
+    reset()
+  end)
+
+  it('the README actions block matches scripts/gen_actions_md.lua', function()
+    local readme = table.concat(vim.fn.readfile(root .. '/README.md'), '\n')
+    local block = readme:match('<!%-%- actions:start %-%->\n(.-)\n<!%-%- actions:end %-%->')
+    ok(block, 'README.md carries the actions:start/actions:end markers')
+    local generated = dofile(root .. '/scripts/gen_actions_md.lua')
+    ok(
+      block == generated,
+      'the README block is stale — regenerate it with: nvim -l scripts/gen_actions_md.lua'
+    )
   end)
 end)
 

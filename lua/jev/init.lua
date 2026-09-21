@@ -241,6 +241,102 @@ function M.ask(text)
   end)
 end
 
+--- `direction=vertical|horizontal`, `count?`, `-` — the signature of one action,
+--- in the notation the panel prints calls in.
+---@param action JevAction
+---@return string
+local function signature(action)
+  local names = {}
+  for name in pairs(action.params or {}) do
+    names[#names + 1] = name
+  end
+  if #names == 0 then
+    return '-'
+  end
+  table.sort(names)
+  local parts = {}
+  for _, name in ipairs(names) do
+    local param = action.params[name] or {}
+    local label = name .. (param.required and '' or '?')
+    if param.type == 'enum' then
+      local values = {}
+      for value in pairs(param.enum or {}) do
+        values[#values + 1] = value
+      end
+      table.sort(values)
+      if #values <= 4 then
+        label = label .. '=' .. table.concat(values, '|')
+      else
+        label = label .. '=' .. #values .. ' options'
+      end
+    elseif param.type == 'integer' and param.min and param.max then
+      label = label .. '=' .. param.min .. '..' .. param.max
+    end
+    parts[#parts + 1] = label
+  end
+  return table.concat(parts, ' ')
+end
+
+--- The catalog as plain lines: a header, then `name  params  description` under
+--- each category. Used by |:JevActions|.
+---@return string[]
+function M.actions_lines()
+  local actions = require('jev.actions')
+  local groups = actions.categories()
+  local width = 0
+  local signatures = {}
+  for _, action in ipairs(actions.list()) do
+    signatures[action.name] = signature(action)
+    width = math.max(width, #action.name)
+  end
+  local lines = {
+    string.format('jev.nvim — %d actions in %d categories', #actions.list(), #groups),
+    'Jev picks exactly one of these, or none. Nothing here is generated.',
+  }
+  for _, group in ipairs(groups) do
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = string.format('%s (%d)', group.name, #group.actions)
+    for _, action in ipairs(group.actions) do
+      local flag = ''
+      if action.destructive then
+        flag = '  [destructive]'
+      elseif action.readOnly then
+        flag = '  [read-only]'
+      end
+      lines[#lines + 1] = string.format(
+        '  %-' .. width .. 's  %-26s  %s%s',
+        action.name,
+        signatures[action.name],
+        action.description,
+        flag
+      )
+    end
+  end
+  return lines
+end
+
+--- Open the catalog in a scratch buffer: `:JevActions`.
+---@return integer buf
+function M.show_actions()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, M.actions_lines())
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].buftype = 'nofile'
+  vim.bo[buf].bufhidden = 'wipe'
+  vim.bo[buf].filetype = 'jevactions'
+  vim.api.nvim_buf_set_name(buf, 'jev://actions')
+  vim.cmd('tabnew')
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(win, buf)
+  vim.wo[win].wrap = false
+  vim.keymap.set('n', 'q', '<cmd>close<cr>', {
+    buffer = buf,
+    nowait = true,
+    desc = 'Close the jev catalog',
+  })
+  return buf
+end
+
 ---@param opts table|nil
 ---@return JevConfig
 function M.setup(opts)

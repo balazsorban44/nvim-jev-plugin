@@ -20,3 +20,7 @@ vim.api.nvim_create_user_command('JevAsk', function(opts)
   end
   jev.ask(opts.args)
 end, { nargs = '*', desc = 'Ask jev for an editor action' })
+
+vim.api.nvim_create_user_command('JevActions', function()
+  require('jev').show_actions()
+end, { desc = 'List the jev action catalog by category' })

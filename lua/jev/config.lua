@@ -23,7 +23,7 @@ M.defaults = {
   model = 'jev-latest',
   url = 'https://api.typesafe.ai/v1/systemone',
   timeout_ms = 15000,
-  width = 44,
+  width = 50,
   prompt = 'jev> ',
   always_confirm = false,
   thresholds = { route = 0.5, auto = 0.8, confirm = 0.6 },
