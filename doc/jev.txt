@@ -1,0 +1,215 @@
+*jev.txt*   Ask for an editor action in plain words        *jev* *jev.nvim*
+
+                                  jev.nvim
+
+A side panel where you type what you want ("split the window vertically",
+"go to line 40", "save everything"). jev.nvim hands your words plus its
+catalog of editor actions to TypeSafe's Jev (System One) model as typed
+questions, decodes the answer into a call, and runs it in the window you
+came from.
+
+Jev is not an LLM. It never writes text. It only picks from options.
+
+==============================================================================
+CONTENTS                                                       *jev-contents*
+
+    1. Requirements ........................... |jev-requirements|
+    2. Setup .................................. |jev-setup|
+    3. Commands ............................... |jev-commands|
+    4. Configuration .......................... |jev-configuration|
+    5. Actions ................................ |jev-actions|
+    6. Confidence and tiers ................... |jev-confidence|
+    7. The flow ............................... |jev-flow|
+    8. Lua API ................................ |jev-api|
+    9. Health ................................. |jev-health|
+   10. Tests .................................. |jev-tests|
+
+==============================================================================
+1. REQUIREMENTS                                            *jev-requirements*
+
+    - Neovim 0.10 or newer
+    - `curl` on your PATH
+    - A TypeSafe API key, from https://console.typesafe.ai/keys
+
+No other dependencies. Pure Lua.
+
+The key is read from `api_key` in |jev-setup|, and otherwise from the
+`$TYPESAFE_API_KEY` environment variable at request time. It is never
+printed, logged, or written to the panel.
+
+==============================================================================
+2. SETUP                                                          *jev-setup*
+
+With lazy.nvim: >lua
+
+    {
+      'balazsorban44/jev.nvim',
+      cmd = { 'Jev', 'JevToggle', 'JevAsk' },
+      keys = {
+        { '<leader>j', '<cmd>JevToggle<cr>', desc = 'Toggle jev' },
+      },
+      opts = {
+        -- api_key = vim.env.TYPESAFE_API_KEY,
+        width = 44,
+      },
+    }
+<
+`opts` calls |jev.setup()| for you. Calling |jev.setup()| is optional: the
+defaults work as soon as `$TYPESAFE_API_KEY` is set.
+
+==============================================================================
+3. COMMANDS                                                    *jev-commands*
+
+                                                                       *:Jev*
+:Jev                    Toggle the panel.
+
+                                                                 *:JevToggle*
+:JevToggle              Toggle the panel. The same thing as |:Jev|, under a
+                        name that reads better in a mapping.
+
+                                                                    *:JevAsk*
+:JevAsk {text}          Open the panel if it is closed, then ask {text}.
+                        Handy for a mapping that asks a fixed question.
+
+Inside the panel, type on the prompt line and press <CR>.
+
+==============================================================================
+4. CONFIGURATION                                          *jev-configuration*
+
+Defaults, in full: >lua
+
+    require('jev').setup({
+      api_key = nil,          -- else $TYPESAFE_API_KEY
+      model = 'jev-latest',
+      url = 'https://api.typesafe.ai/v1/systemone',
+      timeout_ms = 15000,
+      width = 44,
+      prompt = 'jev> ',
+      always_confirm = false,
+      thresholds = { route = 0.5, auto = 0.8, confirm = 0.6 },
+    })
+<
+                                                            *jev-always_confirm*
+`always_confirm`        When true, every runnable tier asks before running,
+                        not just |jev-confirm|.
+
+                                                              *jev-thresholds*
+`thresholds`            See |jev-confidence|. `route` is the minimum
+                        probability for the chosen action; `auto` and
+                        `confirm` band the call's confidence.
+
+`model`                 `jev-latest` tracks the newest stable release, so the
+                        answers behind it can move. Pin a versioned id such
+                        as `jev-1.13.0` if you have tuned thresholds.
+
+==============================================================================
+5. ACTIONS                                                      *jev-actions*
+
+The catalog is fixed. Jev picks one entry, or `__none__`.
+
+    save_file           Write this buffer.
+    save_all            Write every modified buffer.
+    close_window        Close this window or split.
+    quit_all            Quit Neovim.                      (destructive)
+    reload_file         Reload from disk, dropping changes. (destructive)
+    open_file           Open {path}.
+    goto_line           Jump to {line}, clamped.          (read-only)
+    split_window        Split {direction}: vertical or horizontal.
+    new_tab             Open a new tab page.
+    next_buffer         Next buffer in this window.       (read-only)
+    previous_buffer     Previous buffer in this window.   (read-only)
+    toggle_option       Flip {option}: number, relativenumber, wrap,
+                        spell, list or cursorline.
+    search              Search for {pattern}.             (read-only)
+    undo                Undo the last change.
+    redo                Redo the last undo.
+    format_buffer       Format with the attached LSP server.
+    select_all          Select the whole buffer.          (read-only)
+    set_filetype        Set {filetype}.
+    show_diagnostics    Diagnostics into the quickfix list. (read-only)
+
+Actions run inside |nvim_win_call()| on the window you came from, wrapped in
+|pcall()|. A failing action prints into the panel; it never throws at you.
+
+==============================================================================
+6. CONFIDENCE AND TIERS                                      *jev-confidence*
+
+Every answer carries a probability. The call's confidence is the *least*
+certain judgement behind it — the route and every argument — because one
+wrong argument is enough to spoil the result.
+
+The policy reads, in order:
+                                                                 *jev-none*
+    none        No action fits, or the route is under `thresholds.route`.
+                The panel prints `? no confident match (best: ... )`.
+                                                           *jev-incomplete*
+    incomplete  A required argument has no usable value.
+                The panel prints `? missing: ...`.
+                                                               *jev-confirm*
+    confirm     Destructive, or shaky (confidence under
+                `thresholds.confirm`). |vim.ui.select()| asks first.
+                                                                  *jev-auto*
+    auto        Read-only and confident (at or over `thresholds.auto`).
+                                                                 *jev-ready*
+    ready       Everything else at or over `thresholds.confirm`. Runs.
+
+`auto` and `ready` both run: you pressed <CR>, that was the click.
+
+==============================================================================
+7. THE FLOW                                                        *jev-flow*
+
+    1. |jev.ask()| takes your line and prints `you: ...`.
+    2. `jev.questions` turns the catalog plus your words into one batch of
+       typed questions: a Choice over action names, and a question per
+       parameter of every action.
+    3. `jev.client` POSTs them through `curl` and |vim.system()|. One request
+       in flight at a time; a newer question supersedes an older one.
+    4. `jev.decode` turns the answers into `{name, args, confidence}`.
+    5. `jev.policy` picks a tier. See |jev-confidence|.
+    6. The action runs in the remembered window.
+
+Every parameter of every action is answered in the same request, so nothing
+needs a second round trip.
+
+==============================================================================
+8. LUA API                                                          *jev-api*
+
+                                                                *jev.setup()*
+require('jev').setup({opts})
+                        Merge {opts} over the defaults. See
+                        |jev-configuration|.
+
+                                                                 *jev.open()*
+require('jev').open()   Open the panel, remembering the current window as the
+                        target.
+
+                                                                *jev.close()*
+require('jev').close()  Close the panel window. The transcript survives.
+
+                                                               *jev.toggle()*
+require('jev').toggle() Open or close.
+
+                                                                  *jev.ask()*
+require('jev').ask({text})
+                        Run the whole flow for {text}. Empty input is
+                        ignored. Safe to call without the panel open.
+
+==============================================================================
+9. HEALTH                                                        *jev-health*
+
+>vim
+    :checkhealth jev
+<
+Checks the Neovim version, `curl`, whether a key is configured (it does not
+print it), and the size of the action catalog.
+
+==============================================================================
+10. TESTS                                                         *jev-tests*
+
+>bash
+    nvim --headless --clean -u NONE -l tests/run.lua < /dev/null
+<
+`< /dev/null` is required: the stock |vim.ui.select()| reads stdin and will
+end a headless process outright.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

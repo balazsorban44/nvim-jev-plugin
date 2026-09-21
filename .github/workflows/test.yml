@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim (stable)
+        run: |
+          curl -fsSL -o nvim.tar.gz \
+            https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz
+          tar -xzf nvim.tar.gz
+          echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Version
+        run: nvim --version
+
+      - name: Test
+        run: nvim --headless --clean -u NONE -l tests/run.lua < /dev/null
