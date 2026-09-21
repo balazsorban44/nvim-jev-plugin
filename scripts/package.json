@@ -1,0 +1,14 @@
+{
+  "name": "jev-nvim-screenshots",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Renders the README screenshots by driving a real Neovim over msgpack-rpc.",
+  "type": "module",
+  "scripts": {
+    "shots": "node screenshot.mjs"
+  },
+  "devDependencies": {
+    "neovim": "^5.3.0",
+    "playwright-core": "^1.50.0"
+  }
+}

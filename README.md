@@ -19,6 +19,37 @@ into a call and applies a policy to it. Nothing is generated.
 Ported from [sdras/jev-webmcp-extension](https://github.com/sdras/jev-webmcp-extension),
 which does the same thing for WebMCP tools in a browser side panel.
 
+## Screenshots
+
+![The jev panel after asking for a vertical split](assets/01-split.png)
+
+`:Jev` opens the panel on the right. *split the window vertically* routes to
+`split_window`, the `direction` option is filled from the same request, and the
+split is already there.
+
+![A read-only action running unprompted](assets/02-goto-line.png)
+
+*go to line 40* decodes to `goto_line {line=40}` — the 40 is lifted from your own
+words, never written by a model. Read-only and above the `auto` threshold, so it
+runs without asking.
+
+![The confirm prompt in front of a destructive action](assets/03-confirm.png)
+
+*throw away my changes and reload the file* lands on `reload_file`, which is
+marked destructive, so the policy stops at `confirm` and `vim.ui.select` asks
+before anything happens.
+
+![No confident match, with the runner-up named](assets/04-none.png)
+
+Nothing in the catalog makes a sandwich, so nothing is invented: the panel says
+so and names the runner-up route. Above it, the two requests that did land — the
+transcript is one buffer and it keeps its history.
+
+These are captures of the plugin actually running, made by
+`node scripts/screenshot.mjs`: it drives a real Neovim over msgpack-rpc and
+answers each request from a table of canned, API-shaped responses in
+`scripts/shot_init.lua`. No API key, no network call, nothing drawn by hand.
+
 ## Install
 
 With [lazy.nvim](https://github.com/folke/lazy.nvim):
@@ -134,6 +165,19 @@ nvim --headless --clean -u NONE -l tests/run.lua < /dev/null
 
 No plenary, no network. `< /dev/null` is required: the stock `vim.ui.select` reads
 stdin and will end a headless process outright, so tests monkeypatch it too.
+
+The screenshots above are regenerated the same way — a real editor, a stubbed
+client:
+
+```bash
+cd scripts && npm install      # once: neovim + playwright-core, not committed
+node scripts/screenshot.mjs    # all four scenes into assets/
+node scripts/screenshot.mjs 03 # just the one whose name matches
+```
+
+Each scene spawns `nvim --embed`, attaches a 120x34 UI, types the request into
+the panel, then paints the cell grid Neovim sent back into a PNG. `JEV_NVIM` and
+`CHROMIUM_PATH` override the binaries it reaches for.
 
 ## License
 
